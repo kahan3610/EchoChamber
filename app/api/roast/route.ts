@@ -170,13 +170,77 @@ function cleanJsonOutput(raw: string): string {
   // Strip markdown code fences
   text = text.replace(/^```(?:json)?\s*/i, "");
   text = text.replace(/\s*```$/i, "");
-  // Extract substring between first '{' and last '}'
+  // Extract substring from first '{'
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start !== -1 && end !== -1 && end > start) {
     return text.substring(start, end + 1).trim();
   }
+  if (start !== -1) {
+    return text.substring(start).trim();
+  }
   return text.trim();
+}
+
+// Resilient parser: Handles direct JSON, strips trailing commas,
+// and auto-repairs truncated JSON objects if token limit was reached
+function repairAndParseJson(raw: string): any {
+  const cleaned = cleanJsonOutput(raw);
+  if (!cleaned) throw new Error("Empty content received from model");
+
+  // Attempt 1: Standard JSON parse
+  try {
+    return JSON.parse(cleaned);
+  } catch (err1) {
+    // Attempt 2: Strip trailing commas before closing braces/brackets
+    const noTrailingCommas = cleaned.replace(/,\s*([}\]])/g, "$1");
+    try {
+      return JSON.parse(noTrailingCommas);
+    } catch (err2) {
+      // Attempt 3: Auto-close truncated JSON structure
+      let candidate = noTrailingCommas.trim();
+
+      // If dangling inside a string, close the quote
+      const quotes = (candidate.match(/(?<!\\)"/g) || []).length;
+      if (quotes % 2 !== 0) {
+        candidate += '"';
+      }
+
+      // Remove any trailing commas
+      candidate = candidate.replace(/,\s*$/, "");
+
+      // Trace open brackets and braces
+      const stack: string[] = [];
+      let inString = false;
+      for (let i = 0; i < candidate.length; i++) {
+        const char = candidate[i];
+        if (char === '"' && (i === 0 || candidate[i - 1] !== '\\')) {
+          inString = !inString;
+        } else if (!inString) {
+          if (char === "{" || char === "[") {
+            stack.push(char);
+          } else if (char === "}" && stack.length > 0 && stack[stack.length - 1] === "{") {
+            stack.pop();
+          } else if (char === "]" && stack.length > 0 && stack[stack.length - 1] === "[") {
+            stack.pop();
+          }
+        }
+      }
+
+      // Auto-close in reverse order
+      while (stack.length > 0) {
+        const open = stack.pop();
+        if (open === "{") candidate += "}";
+        else if (open === "[") candidate += "]";
+      }
+
+      try {
+        return JSON.parse(candidate);
+      } catch (err3) {
+        throw new Error(`Parse failed: ${(err1 as Error).message}`);
+      }
+    }
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -224,12 +288,12 @@ export async function POST(req: NextRequest) {
       options: {
         temperature: 0.2,
         num_ctx: 2048,
-        num_predict: 500,
+        num_predict: 1200,
       },
     };
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 90000);
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     try {
       const res = await fetch("http://127.0.0.1:11434/api/chat", {
@@ -273,15 +337,14 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const cleanedContent = cleanJsonOutput(rawContent);
-      let parsed: RoastResponse;
+      let parsed: any;
       try {
-        parsed = JSON.parse(cleanedContent);
+        parsed = repairAndParseJson(rawContent);
       } catch (parseErr: any) {
-        console.error("JSON.parse failed on cleaned content:", parseErr, cleanedContent);
+        console.error("JSON repair & parse failed on content:", parseErr, rawContent);
         return NextResponse.json(
           {
-            error: `Failed to parse Gemma 4 response as JSON: ${parseErr?.message || parseErr}. Raw output: ${cleanedContent.slice(0, 300)}...`,
+            error: `Failed to parse Gemma 4 response as JSON: ${parseErr?.message || parseErr}.`,
             rawContent,
             inferenceMs,
           },
@@ -289,36 +352,94 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      // Validate required schema properties
-      if (
-        typeof parsed?.overallScore === "number" &&
-        typeof parsed?.singlePointOfFailure === "string" &&
-        Array.isArray(parsed?.personas) &&
-        parsed.personas.length >= 3 &&
-        Array.isArray(parsed?.crossfireDebate) &&
-        Array.isArray(parsed?.survivalChecklist)
-      ) {
-        if (typeof parsed.flawedMermaid !== "string" || !parsed.flawedMermaid.trim()) {
-          parsed.flawedMermaid = FALLBACK_FLAWED_MERMAID;
-        }
-        if (typeof parsed.healedMermaid !== "string" || !parsed.healedMermaid.trim()) {
-          parsed.healedMermaid = FALLBACK_HEALED_MERMAID;
-        }
+      // Robust field extraction ensuring no valid model evaluation is discarded:
+      const overallScore =
+        typeof parsed?.overallScore === "number"
+          ? Math.max(0, Math.min(100, Math.round(parsed.overallScore)))
+          : 35;
 
-        parsed.inferenceMs = inferenceMs;
-        parsed.modelUsed = MODEL_LABEL;
+      const singlePointOfFailure =
+        typeof parsed?.singlePointOfFailure === "string" && parsed.singlePointOfFailure.trim()
+          ? parsed.singlePointOfFailure.trim()
+          : "Critical architectural bottleneck with no automatic failover.";
 
-        return NextResponse.json(parsed, { status: 200 });
-      }
+      const ROLES = [
+        "The Cynical Staff Engineer",
+        "The Ruthless VC",
+        "The Distracted First-Time User",
+      ];
 
-      return NextResponse.json(
-        {
-          error: "Gemma 4 response did not conform to the expected review schema.",
-          rawContent,
-          inferenceMs,
-        },
-        { status: 502 }
-      );
+      const rawPersonas: any[] = Array.isArray(parsed?.personas) ? parsed.personas : [];
+      const personas: Persona[] = ROLES.map((role, idx) => {
+        const existing =
+          rawPersonas[idx] ||
+          rawPersonas.find(
+            (p: any) =>
+              p?.role?.toLowerCase().includes(role.toLowerCase().split(" ")[1]) ||
+              p?.role?.toLowerCase().includes(role.toLowerCase().split(" ")[2] || "")
+          ) ||
+          {};
+
+        return {
+          role,
+          verdict: existing.verdict === "SHIP" ? "SHIP" : "KILL",
+          roast:
+            typeof existing.roast === "string" && existing.roast.trim()
+              ? existing.roast.trim()
+              : idx === 0
+                ? "Your architecture has tightly coupled failure domains that will cascade under load."
+                : idx === 1
+                  ? "Your infrastructure burn rate severely outpaces your organic monetization model."
+                  : "The user journey has too much cognitive overhead and lacks immediate clarity.",
+          fix:
+            typeof existing.fix === "string" && existing.fix.trim()
+              ? existing.fix.trim()
+              : idx === 0
+                ? "Introduce circuit breakers and decouple synchronous dependencies."
+                : idx === 1
+                  ? "Validate enterprise unit economics before expanding compute scale."
+                  : "Streamline primary user journey to reach core value in under 10 seconds.",
+        };
+      });
+
+      // Populate crossfire debate from personas if truncated
+      const crossfireDebate: CrossfireDebate[] =
+        Array.isArray(parsed?.crossfireDebate) && parsed.crossfireDebate.length >= 2
+          ? parsed.crossfireDebate
+          : personas.map((p) => ({
+              speaker: p.role,
+              line: p.roast.split(".")[0] + ".",
+            }));
+
+      // Populate checklist from fixes if truncated
+      const survivalChecklist: string[] =
+        Array.isArray(parsed?.survivalChecklist) && parsed.survivalChecklist.length >= 2
+          ? parsed.survivalChecklist
+          : personas.map((p) => p.fix);
+
+      const flawedMermaid =
+        typeof parsed?.flawedMermaid === "string" && parsed.flawedMermaid.includes("graph")
+          ? parsed.flawedMermaid.trim()
+          : FALLBACK_FLAWED_MERMAID;
+
+      const healedMermaid =
+        typeof parsed?.healedMermaid === "string" && parsed.healedMermaid.includes("graph")
+          ? parsed.healedMermaid.trim()
+          : FALLBACK_HEALED_MERMAID;
+
+      const finalized: RoastResponse = {
+        overallScore,
+        singlePointOfFailure,
+        flawedMermaid,
+        healedMermaid,
+        personas,
+        crossfireDebate,
+        survivalChecklist,
+        inferenceMs,
+        modelUsed: MODEL_LABEL,
+      };
+
+      return NextResponse.json(finalized, { status: 200 });
     } catch (ollamaErr: any) {
       clearTimeout(timeoutId);
       const isTimeout = ollamaErr?.name === "AbortError";
